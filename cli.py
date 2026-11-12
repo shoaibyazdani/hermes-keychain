@@ -9,15 +9,18 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import sys
+from pathlib import Path
 
 try:  # package load (Hermes plugin loader)
     from . import keychain_core as kc
 except ImportError:  # direct module load (unit tests)
     import keychain_core as kc
 try:  # package load (Hermes plugin loader)
-    from . import tools
+    from . import dotenv_edit, tools
 except ImportError:  # direct module load (unit tests)
+    import dotenv_edit
     import tools
 
 
@@ -43,7 +46,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     test.add_argument("name")
     test.add_argument("--service", default=None)
 
-    migrate = subs.add_parser("migrate", help="Move .env keys into the keychain")
+    migrate = subs.add_parser(
+        "migrate",
+        help="Move .env keys into the keychain, then remove them via `hermes config unset` semantics")
     migrate.add_argument("names", nargs="*", help="Variable names; omit for a credential-looking sweep")
     migrate.add_argument("--dry-run", action="store_true")
 
@@ -190,28 +195,99 @@ def _test(args: argparse.Namespace) -> int:
 
 
 def _migrate(args: argparse.Namespace) -> int:
-    names = list(args.names) or ["*"]
-    report = json.loads(tools.keychain_migrate({"names": names, "dry_run": args.dry_run}))
-    if not report.get("ok"):
-        print(f"error: {report.get('error')}", file=sys.stderr)
+    """Store .env values in the keychain, then remove them through core's own writer.
+
+    Order is the guarantee: store → read back (inside ``write_secret``) → only then remove.
+    The removal itself goes through ``hermes_cli.config.remove_env_value`` — core's `.env`
+    lock and its refusals for package-managed installs and admin-managed keys come with it.
+    ``.env`` is copied first, so the values are recoverable.
+    """
+    if not _guard_platform():
         return 1
-    moved = report.get("migrated") or []
-    skipped = report.get("skipped") or []
-    verb = "would move" if args.dry_run else "moved"
-    for entry in moved:
-        suffix = "" if args.dry_run else (
-            ", .env stripped" if entry.get("env_line_stripped") else ", live env only")
-        print(f"  {verb} {entry['name']} ({entry['length']} chars{suffix})")
-    for entry in skipped:
-        print(f"  skipped {entry['name']}: {entry['reason']}")
-    if not moved and not skipped:
-        print(report.get("note") or "nothing to do")
-    backup = (report.get("dotenv") or {}).get("backup")
-    if backup:
-        print(f"backup: {backup}")
-    if moved and not args.dry_run:
-        print(report.get("next", ""))
-    return 0
+
+    plan = json.loads(tools.keychain_migration_plan({"names": list(args.names) or ["*"]}))
+    if not plan.get("ok"):
+        print(f"error: {plan.get('error')}", file=sys.stderr)
+        return 1
+
+    candidates = plan.get("candidates") or []
+    if not candidates:
+        print("nothing to move — no credential-looking values in .env")
+        return 0
+
+    if args.dry_run:
+        for entry in candidates:
+            print(f"  would move {entry['name']} ({entry['length']} chars)")
+        print("  (dry run — nothing stored, .env untouched)")
+        return 0
+
+    try:
+        from hermes_cli.config import remove_env_value
+    except Exception:
+        print("cannot import hermes_cli.config.remove_env_value; refusing to touch .env.\n"
+              "Store the key with `hermes keychain put NAME`, then run "
+              "`hermes config unset NAME` yourself.", file=sys.stderr)
+        return 1
+
+    env_path = Path(plan["dotenv"]) if plan.get("dotenv") else None
+    hits = {}
+    if env_path and env_path.exists():
+        try:
+            hits = dotenv_edit.scan(env_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            hits = {}
+
+    service = plan.get("service") or kc.DEFAULT_SERVICE
+    backup_path = ""
+    stored: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for entry in candidates:
+        name = entry["name"]
+        value = os.environ.get(name) or (hits[name].value if name in hits else "")
+        if not value:
+            failed.append((name, "no value in .env or the environment"))
+            continue
+        try:
+            kc.write_secret(service, name, value)
+            kc.index_add(service, name)
+        except kc.KeychainError as exc:
+            kc.record("migrate", env=name, service=service, ok=False, kind=exc.kind)
+            failed.append((name, str(exc)))
+            continue
+        kc.record("migrate", env=name, service=service, ok=True)
+        stored.append(name)
+
+    removed: list[str] = []
+    kept: list[tuple[str, str]] = []
+    if stored and env_path and env_path.exists():
+        try:
+            made = dotenv_edit.backup(env_path)
+            backup_path = str(made) if made else ""
+        except OSError:
+            pass
+        for name in stored:
+            try:
+                if remove_env_value(name):
+                    removed.append(name)
+                else:
+                    kept.append((name, "core refused, or the key was not in .env"))
+            except Exception as exc:
+                kept.append((name, f"core raised {exc.__class__.__name__}"))
+
+    for name in removed:
+        print(f"  moved   {name} → keychain, removed from .env")
+    for name in stored:
+        if name not in removed:
+            print(f"  stored  {name} → keychain; .env left alone "
+                  f"({dict(kept).get(name, 'not in .env')})")
+    for name, reason in failed:
+        print(f"  failed  {name}: {reason}", file=sys.stderr)
+    if backup_path:
+        print(f"backup: {backup_path}")
+    if removed:
+        print("restart Hermes (or open a new session) so startup resolution reads the keychain")
+    return 0 if not failed else 1
 
 
 def _audit(args: argparse.Namespace) -> int:

@@ -1,9 +1,12 @@
 """macOS Keychain primitives for the ``keychain`` plugin.
 
 A thin, testable wrapper over ``/usr/bin/security`` — no Python keychain bindings, no
-shell. Every call is an argv list, the child gets a minimal allowlisted environment,
-stdin is ``/dev/null`` (so a locked-keychain prompt fails fast instead of hanging Hermes
-startup), every call has a hard timeout, and **no value is ever logged**.
+shell. The binary is addressed by **absolute path**: ``security`` receives secret values on
+argv, so resolving it through ``PATH`` would hand every stored value to whatever earlier
+``security`` a modified ``PATH`` put in front of it. Every call is an argv list, the child
+gets a minimal allowlisted environment, stdin is ``/dev/null`` (so a locked-keychain prompt
+fails fast instead of hanging Hermes startup), every call has a hard timeout, and **no
+value is ever logged**.
 
 This module deliberately has no relative imports so it can be unit-tested on its own.
 """
@@ -13,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -70,13 +72,17 @@ class Item:
     account: str
 
 
+# Absolute path only. `security` receives values on argv, so it is never resolved through PATH.
+SECURITY_BIN = "/usr/bin/security"
+
+
 def is_supported() -> bool:
-    """True on macOS with the ``security`` CLI present."""
-    return sys.platform == "darwin" and _security_bin() is not None
+    """True on macOS with the system ``security`` CLI present."""
+    return sys.platform == "darwin" and Path(SECURITY_BIN).exists()
 
 
 def _security_bin() -> Optional[str]:
-    return shutil.which("security") or ("/usr/bin/security" if Path("/usr/bin/security").exists() else None)
+    return SECURITY_BIN if Path(SECURITY_BIN).exists() else None
 
 
 def _child_env() -> dict[str, str]:
@@ -92,7 +98,7 @@ def _run(argv: list[str], timeout: float = DEFAULT_TIMEOUT) -> subprocess.Comple
     """Run ``security`` with stdin closed. Raises :class:`KeychainError` on spawn/timeout."""
     binary = _security_bin()
     if binary is None:
-        raise KeychainError(INTERNAL, "the macOS `security` CLI was not found on PATH")
+        raise KeychainError(INTERNAL, f"{SECURITY_BIN} is missing; this source is macOS-only")
     try:
         return subprocess.run(
             [binary, *argv],

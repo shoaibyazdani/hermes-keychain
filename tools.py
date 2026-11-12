@@ -1,4 +1,11 @@
-"""Agent tools: inspect the binding state, migrate plaintext keys, read the audit trail.
+"""Agent tools: inspect binding state, plan a migration, read the audit trail.
+
+**No tool here writes anything.** In particular ``keychain_migration_plan`` is report-only:
+it never stores a secret and never touches `.env`. Migration happens only in the
+``hermes keychain migrate`` CLI, which the operator runs — a model choosing secret names and
+rewriting `<hermes home>/.env` unattended is the failure mode Hermes keeps the model away
+from (and if the source is off or the login keychain is locked at the next startup, every
+migrated key would be gone).
 
 Every handler returns a JSON string, never raises, and never emits a secret value — only
 names, lengths and outcomes.
@@ -162,23 +169,24 @@ def keychain_status(args: dict, **kwargs) -> str:
         return _err(f"status failed: {exc.__class__.__name__}: {exc}")
 
 
-# --- keychain_migrate -------------------------------------------------------------------
+# --- keychain_migration_plan ------------------------------------------------------------
 
-def keychain_migrate(args: dict, **kwargs) -> str:
-    """Move named variables from .env (or the live environment) into the keychain.
+# --- keychain_migration_plan ------------------------------------------------------------
 
-    Order of operations per name is deliberate: store → verify readback (inside
-    ``write_secret``) → only then strip the value out of .env. A failed store leaves
-    ``.env`` untouched.
+def keychain_migration_plan(args: dict, **kwargs) -> str:
+    """Report-only: list the keys that *could* move, and the exact command a human runs.
+
+    Deliberately side-effect free. Storing into the keychain and removing the `.env` line
+    are operator actions (`hermes keychain migrate`), because a model rewriting
+    `<hermes home>/.env` unattended can strand every provider key if the source is disabled
+    or the login keychain is locked at the next startup.
     """
     try:
         if not kc.is_supported():
             return _err("the keychain is macOS-only (needs /usr/bin/security)")
         cfg = _source_config()
         service = _service(cfg)
-        dry_run = bool(args.get("dry_run"))
         requested = _normalize_names(args.get("names"))
-
         env_path, hits = _dotenv_hits()
         sweep = not requested or requested in (["*"], ["all"])
 
@@ -186,74 +194,43 @@ def keychain_migrate(args: dict, **kwargs) -> str:
             candidates = [n for n in hits if _looks_like_credential(n, hits[n].value)]
         else:
             candidates = [n for n in requested if kc.ENV_NAME_RE.match(n)]
+        candidates = candidates[:kc.MAX_MIGRATE]
 
-        if not candidates:
-            return json.dumps({
-                "ok": True, "service": service, "dry_run": dry_run,
-                "migrated": [], "skipped": [],
-                "note": "no candidates: pass names explicitly, or use names: ['*'] for "
-                        "credential-looking variables in .env",
-            }, indent=2)
+        try:
+            already = set(kc.list_index(service))
+        except kc.KeychainError:
+            already = set()
 
-        migrated: list[dict] = []
-        skipped: list[dict] = []
-        to_strip: set[str] = set()
-
-        for name in candidates[:kc.MAX_MIGRATE]:
+        plan = []
+        for name in candidates:
             live = os.environ.get(name) or (hits[name].value if name in hits else "")
             if not live:
-                skipped.append({"name": name, "reason": "no value in .env or the environment"})
                 continue
-            if name in os.environ and name in hits and os.environ[name] != hits[name].value:
-                skipped.append({"name": name, "reason": "environment and .env disagree; "
-                                                       "resolved it by hand first"})
-                continue
-            if dry_run:
-                migrated.append({"name": name, "length": len(live), "would_store": True})
-                continue
-            try:
-                kc.write_secret(service, name, live)
-                kc.index_add(service, name)
-            except kc.KeychainError as exc:
-                kc.record("migrate", env=name, service=service, ok=False, kind=exc.kind)
-                skipped.append({"name": name, "reason": f"store failed: {exc}"})
-                continue
-            kc.record("migrate", env=name, service=service, ok=True)
-            if name in hits:
-                to_strip.add(name)
-            migrated.append({"name": name, "length": len(live), "env_line_stripped": name in hits})
+            plan.append({
+                "name": name,
+                "length": len(live),
+                "in_dotenv": name in hits,
+                "already_in_keychain": name in already,
+            })
 
-        backup_path = ""
-        if to_strip and not dry_run and env_path is not None:
-            try:
-                original = env_path.read_text(encoding="utf-8", errors="replace")
-                new_text, _ = dotenv_edit.strip_names(original, to_strip)
-                if new_text != original:
-                    made = dotenv_edit.backup(env_path)
-                    backup_path = str(made) if made else ""
-                    dotenv_edit.write_atomic(env_path, new_text)
-            except OSError as exc:
-                return json.dumps({
-                    "ok": False, "error": f"keys are in the keychain but .env could not be "
-                                          f"rewritten: {exc}", "migrated": migrated,
-                    "skipped": skipped, "service": service,
-                }, indent=2)
-
-        remaining = [i["name"] for i in migrated if not i.get("env_line_stripped", False)]
         return json.dumps({
             "ok": True,
+            "report_only": True,
+            "wrote_nothing": True,
             "service": service,
-            "dry_run": dry_run,
-            "migrated": migrated,
-            "skipped": skipped,
-            "dotenv": {"path": str(env_path) if env_path else "", "backup": backup_path},
-            "next": ("Enable the source (secrets.keychain.enabled: true) and restart the gateway "
-                     "so startup resolves these from the keychain — values already in this "
-                     "process keep working until then."
-                     if remaining or migrated else "nothing to do"),
+            "dotenv": str(env_path) if env_path else "",
+            "candidates": plan,
+            "run_in_terminal": ("hermes keychain migrate " + " ".join(p["name"] for p in plan)) if plan else "",
+            "what_the_command_does": (
+                "stores each value in the login keychain, verifies it by readback, backs up "
+                ".env (0600), then removes the variable through Hermes' own "
+                "config.remove_env_value — the `hermes config unset` path, which takes core's "
+                ".env lock and refuses package-managed or admin-managed keys"
+            ),
+            "note": "Nothing has been moved. A human runs the command; this tool never writes.",
         }, indent=2)
     except Exception as exc:
-        return _err(f"migrate failed: {exc.__class__.__name__}: {exc}")
+        return _err(f"plan failed: {exc.__class__.__name__}: {exc}")
 
 
 # --- keychain_audit ---------------------------------------------------------------------
@@ -290,12 +267,13 @@ STATUS_SCHEMA = {
     "parameters": _EMPTY_OBJECT,
 }
 
-MIGRATE_SCHEMA = {
-    "name": "keychain_migrate",
+PLAN_SCHEMA = {
+    "name": "keychain_migration_plan",
     "description": (
-        "Move API keys out of plaintext ~/.hermes/.env into the macOS Keychain. Each value is "
-        "stored, read back and compared before the .env line is replaced with a comment; .env is "
-        "backed up first. Pass explicit variable names, or '*' for credential-looking ones."
+        "Report-only plan for moving API keys out of plaintext ~/.hermes/.env into the macOS "
+        "Keychain: lists the candidates and returns the exact `hermes keychain migrate ...` "
+        "command for the user to run. This tool writes nothing — no keychain item and no .env "
+        "edit. Use it to advise; the human performs the migration."
     ),
     "parameters": {
         "type": "object",
@@ -303,11 +281,7 @@ MIGRATE_SCHEMA = {
             "names": {
                 "type": ["array", "string"],
                 "items": {"type": "string"},
-                "description": "Env-var names to migrate, e.g. ['OPENAI_API_KEY'], or '*' for a sweep.",
-            },
-            "dry_run": {
-                "type": "boolean",
-                "description": "Report what would move without touching the keychain or .env.",
+                "description": "Env-var names to plan for, e.g. ['OPENAI_API_KEY'], or '*' for a sweep.",
             },
         },
         "additionalProperties": False,

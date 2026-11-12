@@ -1,6 +1,6 @@
 name: keychain
-version: 0.1.0
-description: "macOS Keychain as a first-class Hermes secret source. Provider API keys resolve from the OS keystore at startup instead of living in .env plaintext; a migration tool moves existing keys in, verifies the readback and strips the value out of .env; every fetch is audited by name and outcome, never by value."
+version: 0.1.1
+description: "macOS Keychain as a first-class Hermes secret source. Provider API keys resolve from the OS keystore at startup instead of living in .env plaintext. Migration (store → verify → remove via Hermes' own config.remove_env_value) is operator-only in the `hermes keychain migrate` CLI; the agent gets a report-only planner. Every fetch is audited by name and outcome, never by value."
 author: Shoaib Yazdani
 kind: standalone
 license: MIT
@@ -10,7 +10,7 @@ requires_hermes: ">=0.23"
 tags: [secrets, keychain, macos, security, credentials]
 provides_tools:
   - keychain_status
-  - keychain_migrate
+  - keychain_migration_plan
   - keychain_audit
 config_keys:
   - secrets.keychain

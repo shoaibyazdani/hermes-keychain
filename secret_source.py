@@ -16,7 +16,7 @@ Two ways a variable gets bound:
              ANTHROPIC_API_KEY: anthropic-prod
 
 2. **Discovered** — anything stored through this plugin (``hermes keychain put NAME``,
-   or the ``keychain_migrate`` tool) is recorded in a keychain-resident index, and every
+   or ``hermes keychain migrate``) is recorded in a keychain-resident index, and every
    indexed name that looks like an environment variable is bound to its own account. That
    makes the common case zero-config: store it once, restart, done.
 """

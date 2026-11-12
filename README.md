@@ -35,7 +35,7 @@ script, no `op run`, no exported shell profile — the same call path it uses fo
 |---|---|---|
 | Secret source | `secrets.keychain` | Resolves bound credentials into the environment at startup |
 | Tool | `keychain_status` | Vault-backed vs plaintext inventory, bindings, recent fetches |
-| Tool | `keychain_migrate` | Moves `.env` keys into the keychain, verifies, strips the value |
+| Tool | `keychain_migration_plan` | Report-only: lists what could move + the exact CLI command (writes nothing) |
 | Tool | `keychain_audit` | The append-only fetch/migrate trail (names and outcomes, never values) |
 | CLI | `hermes keychain` | `put`, `ls`, `rm`, `test`, `migrate`, `status`, `audit` |
 
@@ -68,8 +68,11 @@ hermes keychain migrate                 # credential-looking names
 hermes keychain migrate OPENAI_API_KEY ANTHROPIC_API_KEY
 ```
 
-From a session you can simply ask: *"move my plaintext API keys into the keychain"* — the
-agent calls `keychain_migrate`.
+From a session the agent can only *plan*: `keychain_migration_plan` lists the candidates and
+hands you the command. **It never stores a key and never edits `.env`.** That asymmetry is
+deliberate — a model choosing secret names and rewriting `<hermes home>/.env` unattended can
+strand every provider key if the source is later disabled or the login keychain is locked at
+the next startup. Migration stays with the human.
 
 Then confirm resolution really happens without `.env`:
 
@@ -111,8 +114,15 @@ Two binding modes, both supported at once:
 * **Values never leave the keystore except into the process env.** They are not logged, not
   in the audit trail, not in tool output, not in error messages. `keychain_status` reports
   names, lengths and outcomes only.
-* **Atomic, minimal `.env` edits.** Mode preserved, temp file + `os.replace`, timestamped
-  0600 backup, value-only removal.
+* **Migration is operator-only, and removal is core's.** Only `hermes keychain migrate` — run
+  by you — stores and then removes a variable, and it removes through
+  `hermes_cli.config.remove_env_value` (the `hermes config unset` path), so core's `.env`
+  lock and its refusals for package-managed installs and admin-managed keys still apply. A
+  0600 timestamped backup is taken first, and nothing is removed until the keychain readback
+  for that name matched. The equivalent tool (`keychain_migration_plan`) is report-only.
+* **`security` is called by absolute path, never through `PATH`.** It receives values on argv,
+  so a shadowed binary earlier in `PATH` would collect every stored key. There is no
+  `shutil.which` lookup: `/usr/bin/security` or nothing.
 * **One honest caveat.** `security add-generic-password` takes the secret on argv, so for the
   microseconds it runs the value is visible to same-user processes (`ps`). Storing via
   `put`/`migrate` is a local, one-shot operation; *reads* — the hot path, once per process —
@@ -132,7 +142,7 @@ Pure logic (dotenv editing, index parsing, failure classification, binding disco
 covered by unit tests that never touch the real keychain:
 
 ```bash
-python -m pytest        # 14 tests
+python -m pytest        # 15 tests
 hermes plugins doctor . # runtime contracts: discovery, manifest, register()
 hermes plugins validate . --install-deps   # the catalog CI gate
 ```

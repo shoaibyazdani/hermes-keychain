@@ -4,7 +4,7 @@ Registers three public surfaces, each independently guarded so one failure canno
 others (or plugin load) down with it:
 
 * a :class:`SecretSource` (``secrets.keychain``) — credential resolution at startup;
-* three tools — ``keychain_status``, ``keychain_migrate``, ``keychain_audit``;
+* three tools — ``keychain_status``, ``keychain_migration_plan`` (report-only), ``keychain_audit``;
 * a CLI command — ``hermes keychain put|ls|rm|test|migrate|status|audit``.
 """
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _TOOLS = (
     (tools.STATUS_SCHEMA, tools.keychain_status, "Inspect keychain bindings and plaintext .env keys", "🔑"),
-    (tools.MIGRATE_SCHEMA, tools.keychain_migrate, "Move .env keys into the macOS Keychain", "🔐"),
+    (tools.PLAN_SCHEMA, tools.keychain_migration_plan, "Plan a .env → Keychain migration (report only)", "🔐"),
     (tools.AUDIT_SCHEMA, tools.keychain_audit, "Read the keychain fetch/migrate audit trail", "📜"),
 )
 

@@ -1,13 +1,13 @@
-"""`.env` editing for the migration path — pure functions, no keychain access.
+"""Read-only `.env` helpers for the migration planner, plus the backup step.
 
-Migration is the one operation that rewrites a file the user cares about, so the editing
-rules are explicit and unit-tested:
+**This module never writes `.env`.** Removing a variable is core's job:
+``hermes_cli.config.remove_env_value()`` (what `hermes config unset` calls) takes core's
+`.env` lock and refuses when the install is package-managed or the key is admin-managed —
+guarantees a plugin-local file writer cannot reproduce. Migration therefore only *reads*
+here, and hands the actual removal to core.
 
-* only the **value** is removed; the line is replaced by a comment that names the variable
-  and says where it went, so a reader still sees why it is gone;
-* the write is atomic (temp file in the same directory, mode 0600, then ``os.replace``);
-* a timestamped backup is copied first (mode 0600), and the original file mode is preserved;
-* nothing is stripped until the keychain readback for that name already matched.
+`backup()` is the one writing helper: a timestamped copy at mode 0600, so an operator can
+recover a value if the keychain item is later deleted.
 """
 
 from __future__ import annotations
@@ -59,49 +59,6 @@ def scan(text: str) -> dict[str, DotenvHit]:
             continue
         hits[name] = DotenvHit(name=name, line_no=idx, raw_value=match.group("value"))
     return hits
-
-
-def strip_names(text: str, names: set[str], *, stamp: Optional[str] = None) -> tuple[str, list[str]]:
-    """Return ``(new_text, removed_names)`` with each migrated variable's value erased.
-
-    Unrelated lines, ordering, blank lines and trailing newline behaviour are preserved.
-    """
-    stamp = stamp or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out: list[str] = []
-    removed: list[str] = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        match = None if not stripped or stripped.startswith("#") else LINE_RE.match(line)
-        name = match.group("name") if match else None
-        if name in names and name not in removed:
-            removed.append(name)
-            out.append(f"# {name} moved to the macOS Keychain by hermes-keychain on {stamp} "
-                       f"(secrets.keychain)")
-            continue
-        out.append(line)
-    return "\n".join(out), removed
-
-
-def write_atomic(path: Path, text: str, mode: Optional[int] = None) -> None:
-    """Replace ``path`` atomically, preserving (or forcing) a 0600-style mode."""
-    path = Path(path)
-    if mode is None:
-        mode = (path.stat().st_mode & 0o777) if path.exists() else 0o600
-    tmp = path.with_name(f".{path.name}.hermes-keychain.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
 
 def backup(path: Path) -> Optional[Path]:
